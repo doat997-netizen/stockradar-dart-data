@@ -1,0 +1,193 @@
+name: Stock Radar US KR Symbol Catalog
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '35 10 * * 1-5'
+permissions:
+  contents: write
+concurrency:
+  group: stock-radar-symbol-catalog
+  cancel-in-progress: false
+jobs:
+  update-symbols:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+    steps:
+      - name: Checkout existing DART data repository
+        uses: actions/checkout@v4
+      - name: Collect and validate official US/KR symbol sources
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          import datetime as dt
+          import io
+          import json
+          import os
+          import re
+          import urllib.request
+          import urllib.error
+          import zipfile
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          NOW = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+          OUT = Path('data')
+          OUT.mkdir(exist_ok=True)
+          UA = {'User-Agent': 'StockRadarCatalog/1.0 research contact: repository owner', 'Accept': '*/*'}
+
+          def fetch(url, max_bytes=15_000_000, timeout=30):
+              req = urllib.request.Request(url, headers=UA)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as res:
+                      if res.status != 200:
+                          raise RuntimeError('HTTP ' + str(res.status))
+                      raw = res.read(max_bytes+1)
+                      if len(raw)>max_bytes: raise RuntimeError('download size limit exceeded')
+                      return raw
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError('source HTTP '+str(e.code)) from None
+              except urllib.error.URLError:
+                  raise RuntimeError('source network connection failed') from None
+
+          def valid_us(code): return re.fullmatch(r'[A-Z0-9][A-Z0-9./^-]{0,14}',code) is not None
+
+          def nasdaq_txt(filename, exchange=None):
+              urls = [f'https://www.nasdaqtrader.com/dynamic/SymDir/{filename}', f'https://nasdaqtrader.com/dynamic/SymDir/{filename}']
+              errors=[]
+              for url in urls:
+                  try:
+                      data=fetch(url,timeout=35).decode('utf-8-sig','replace').splitlines()
+                      lines=[line.split('|') for line in data if '|' in line and not line.startswith('File Creation Time')]
+                      if len(lines)<100: raise RuntimeError('too few records')
+                      header=[x.strip() for x in lines[0]]
+                      out=[]
+                      for vals in lines[1:]:
+                          obj=dict(zip(header,vals))
+                          if obj.get('Test Issue','').upper()=='Y':continue
+                          ticker=(obj.get('Symbol') or obj.get('ACT Symbol') or obj.get('NASDAQ Symbol') or '').strip().upper()
+                          name=(obj.get('Security Name') or '').strip()
+                          exch = exchange or {'N':'NYSE','A':'AMEX','P':'ARCA','Z':'CBOE','V':'IEX'}.get(obj.get('Exchange','').strip(),'')
+                          if not valid_us(ticker) or len(name)<2 or len(name)>200 or not exch: continue
+                          out.append({'ticker':ticker,'name':name,'exchange':exch,'kind':'ETF' if obj.get('ETF','').strip()=='Y' else 'unknown'})
+                      if len(out)<100:raise RuntimeError('too few valid entries')
+                      return out
+                  except Exception as e: errors.append(str(e)[:60])
+              raise RuntimeError(filename+' unavailable: '+', '.join(errors))
+
+          def sec_tickers():
+              raw=fetch('https://www.sec.gov/files/company_tickers_exchange.json',max_bytes=12_000_000,timeout=25)
+              obj=json.loads(raw)
+              fields=obj.get('fields',[])
+              rows=obj.get('data',[])
+              if not isinstance(fields,list) or not isinstance(rows,list):raise ValueError('SEC ticker table invalid')
+              lookup={}
+              for vals in rows:
+                  r=dict(zip(fields,vals))
+                  t=str(r.get('ticker') or '').strip().upper()
+                  if not valid_us(t):continue
+                  try: cik=int(r.get('cik') or 0)
+                  except (TypeError,ValueError):continue
+                  if not (0<cik<10**10):continue
+                  lookup[t]={'cik':str(cik),'name':str(r.get('name') or '').strip()[:180], 'exchange':str(r.get('exchange') or '').strip()}
+              if len(lookup)<1000:raise ValueError('SEC mapping too small')
+              return lookup
+
+          def us_catalog():
+              source_errors=[]; sources=[]; raw=[]
+              for filename,exchange in [('nasdaqlisted.txt','NASDAQ'),('otherlisted.txt',None)]:
+                  try:
+                      rows=nasdaq_txt(filename,exchange)
+                      sources.append(filename);raw.extend(rows)
+                      print(filename+': '+str(len(rows))+' validated rows')
+                  except Exception as e:
+                      source_errors.append(str(e));print('source unavailable:',filename,'(preserving existing records if needed)')
+              try:
+                  sec=sec_tickers();print('SEC CIK map:',len(sec))
+              except Exception:
+                  sec={};print('SEC CIK map unavailable; official link will use ticker search')
+              if len(sources)<2 and (OUT/'symbols_us.json').exists():
+                  raise RuntimeError('One or more Nasdaq listing feeds unavailable; previous complete snapshot preserved')
+              if not raw and sec:
+                  exmap={'Nasdaq':'NASDAQ','NYSE':'NYSE','NYSE American':'AMEX','NYSE Arca':'ARCA','Cboe':'CBOE','IEX':'IEX'}
+                  for t,v in sec.items():
+                      ex=exmap.get(v['exchange'])
+                      if ex and v['name']:raw.append({'ticker':t,'name':v['name'],'exchange':ex,'kind':'unknown'})
+                  sources=['SEC company_tickers_exchange.json (incomplete exchange directory fallback)']
+              if len(raw)<1200:raise RuntimeError('US official sources incomplete; existing data preserved')
+              unique={}
+              for row in raw:
+                  t=row['ticker'];mapped=sec.get(t,{})
+                  if mapped.get('cik'): row['cik']=mapped['cik']
+                  unique[(row['exchange'],t)]=row
+              result=sorted(unique.values(),key=lambda x:(x['ticker'],x['exchange']))
+              if len(result)<1200 or len(result)>30000:raise RuntimeError('US coverage guard refused write')
+              return {'schema':'sr-stock-catalog-v1','market':'US','updated_at':NOW,'source':', '.join(sources),'counts':{'total':len(result)},'rows':result}
+
+          def kr_catalog():
+              key=os.environ.get('DART_API_KEY','').strip()
+              if not re.fullmatch(r'[A-Za-z0-9]{40}',key):raise RuntimeError('DART_API_KEY secret missing or invalid shape')
+              import urllib.parse
+              base='https://opendart.fss.or.kr/api/corpCode.xml?'+urllib.parse.urlencode({'crtfc_key':key})
+              raw=fetch(base,max_bytes=16_000_000,timeout=50)
+              with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                  entries=[n for n in z.namelist() if n.upper().endswith('CORPCODE.XML')]
+                  if len(entries)!=1:raise RuntimeError('expected exactly one CORPCODE.xml')
+                  info=z.getinfo(entries[0]);
+                  if info.file_size>95_000_000:raise RuntimeError('CORPCODE.xml too large')
+                  xml=z.read(entries[0])
+              root=ET.fromstring(xml);out={};total=0
+              for item in root.iter('list'):
+                  total+=1
+                  code=(item.findtext('stock_code') or '').strip().upper()
+                  name=(item.findtext('corp_name') or '').strip()
+                  corp=(item.findtext('corp_code') or '').strip()
+                  if not re.fullmatch('[A-Z0-9]{6}',code) or not re.fullmatch(r'\d{8}',corp) or not (1<len(name)<200):continue
+                  out[code]={'code':code,'name':name,'corp':corp,'market':'unknown','modified':(item.findtext('modify_date') or '')[:8]}
+              items=sorted(out.values(),key=lambda r:r['code'])
+              print('DART corporate registry:',total,'companies; stock codes:',len(items),'(current listing not independently verified)')
+              if not 900<=len(items)<=30000:raise RuntimeError('DART registry coverage guard refused write')
+              return {'schema':'sr-stock-catalog-v1','market':'KR','updated_at':NOW,'source':'OpenDART corpCode.xml (stock_code present; historical entities possible)', 'counts':{'total':len(items),'corporations':total},'rows':items}
+
+          completed=0
+          for market,name,func in [('US','symbols_us.json',us_catalog),('KR','symbols_kr.json',kr_catalog)]:
+              try:
+                  data=func()
+                  content=json.dumps(data,ensure_ascii=False,separators=(',',':'))+'\n'
+                  target=OUT/name
+                  # Update only on actual changes to entries. Do not force daily commits just for timestamp.
+                  if target.exists():
+                      try:
+                          old=json.loads(target.read_text('utf-8'))
+                          if old.get('rows')==data['rows']:
+                              print(market,': unchanged, preserving existing snapshot timestamp')
+                              completed+=1;continue
+                      except (ValueError,UnicodeError):pass
+                  target.write_text(content,encoding='utf-8')
+                  print(market,': saved',len(data['rows']),'records')
+                  completed+=1
+              except Exception as e:
+                  print(market,': WARNING',str(e)[:130],'- existing snapshot not overwritten')
+          if not completed:raise SystemExit('No source passed validation; old files preserved')
+          PY
+      - name: Publish only validated snapshots
+        shell: bash
+        run: |
+          git config user.name "stockradar-data-bot"
+          git config user.email "stockradar-data-bot@users.noreply.github.com"
+          for target in data/symbols_us.json data/symbols_kr.json; do
+            if [ -f "$target" ]; then git add -- "$target"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "No symbol changes to publish."
+            exit 0
+          fi
+          git commit -m "Update US KR symbol catalog"
+          for retry in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            sleep 3
+          done
+          echo "GitHub push failed; prior published data remains valid"
+          exit 1
