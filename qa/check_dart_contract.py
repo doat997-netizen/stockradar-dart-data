@@ -53,6 +53,8 @@ def validate(data):
             seen.add(no)
         if not day(x.get("rcept_dt")):
             errors.append(f"item {i}: invalid filing date")
+        elif x["rcept_dt"] not in set(days):
+            errors.append(f"item {i}: receipt date outside covered_days")
         corp=x.get("corp_code")
         if not isinstance(corp,str) or re.fullmatch(r"\d{8}",corp) is None or corp=="00000000":
             errors.append(f"item {i}: invalid corporate code")
