@@ -39,6 +39,7 @@ def validate(data):
         items=[]
     if type(data.get("count")) is not int or data.get("count")!=len(items):
         errors.append("count mismatch")
+    day_set=set(days)
     seen=set()
     for i,x in enumerate(items):
         if not isinstance(x,dict):
@@ -53,7 +54,7 @@ def validate(data):
             seen.add(no)
         if not day(x.get("rcept_dt")):
             errors.append(f"item {i}: invalid filing date")
-        elif x["rcept_dt"] not in set(days):
+        elif x["rcept_dt"] not in day_set:
             errors.append(f"item {i}: receipt date outside covered_days")
         corp=x.get("corp_code")
         if not isinstance(corp,str) or re.fullmatch(r"\d{8}",corp) is None or corp=="00000000":
